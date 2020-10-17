@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/storage/raft_storage"
@@ -38,22 +37,62 @@ func NewServer(storage storage.Storage) *Server {
 // Raw API.
 func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	res := &kvrpcpb.RawGetResponse{}
+	key, cf := req.Key, req.Cf
+	reader, err := server.storage.Reader(nil)
+	if err != nil {
+		return nil, err
+	}
+	val, err := reader.GetCF(cf, key)
+	if val == nil {
+		res.NotFound = true
+	}
+	res.Value = val
+	return res, nil
 }
 
 func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	// Your Code Here (1).
+	key, value, cf := req.Key, req.Value, req.Cf
+	err := server.storage.Write(nil, []storage.Modify{
+		{storage.Put{key, value, cf}},
+	})
+	if err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 
 func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest) (*kvrpcpb.RawDeleteResponse, error) {
 	// Your Code Here (1).
+	key, cf := req.Key, req.Cf
+	err := server.storage.Write(nil, []storage.Modify{
+		{storage.Delete{key, cf}},
+	})
+	if err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	res := &kvrpcpb.RawScanResponse{}
+	startKey, limit, cf := req.StartKey, req.Limit, req.Cf
+	reader, err := server.storage.Reader(nil)
+	if err != nil {
+		return nil, err
+	}
+	iter := reader.IterCF(cf)
+	defer iter.Close()
+	for iter.Seek(startKey); iter.Valid() && limit > 0; iter.Next() {
+		item := iter.Item()
+		key := item.Key()
+		val, _ := item.Value()
+		res.Kvs = append(res.Kvs, &kvrpcpb.KvPair{Key: key, Value: val})
+		limit--
+	}
+	return res, nil
 }
 
 // Raft commands (tinykv <-> tinykv)
