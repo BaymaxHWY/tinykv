@@ -192,7 +192,17 @@ func (r *Raft) recoverRaft() {
 	state, _, _ := r.RaftLog.storage.InitialState()
 	r.Term, r.RaftLog.committed, r.Vote = state.Term, state.Commit, state.Vote
 }
-
+// send log to peers
+func (r *Raft) AppendEntry() {
+	if len(r.peers) == 1 {
+		r.RaftLog.committed = r.RaftLog.LastIndex()
+	}
+	for _, to := range r.peers {
+		if to != r.id {
+			r.sendAppend(to)
+		}
+	}
+}
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
@@ -211,13 +221,13 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Snapshot: nil,
 	}
 	for _, entry := range r.RaftLog.entries {
-		newEntry := &pb.Entry{
-			EntryType: entry.EntryType,
-			Term:      entry.Term,
-			Index:     entry.Index,
-			Data:      entry.Data,
-		}
 		if entry.Index >= prs.Next {
+			newEntry := &pb.Entry{
+				EntryType: entry.EntryType,
+				Term:      entry.Term,
+				Index:     entry.Index,
+				Data:      entry.Data,
+			}
 			msg.Entries = append(msg.Entries, newEntry)
 		}
 	}
@@ -305,19 +315,12 @@ func (r *Raft) becomeLeader() {
 	r.Prs = map[uint64]*Progress{}
 	newEntry := pb.Entry{Term: r.Term, Index: r.RaftLog.LastIndex() + 1}
 	for _, s := range r.peers {
-		if s != r.id {
-			r.Prs[s] = &Progress{
-				Match: 0,
-				Next:  newEntry.Index,
-			}
-		} else {
-			r.Prs[s] = &Progress{
-				Match: newEntry.Index,
-				Next:  newEntry.Index + 1,
-			}
+		r.Prs[s] = &Progress{
+			Match: 0,
+			Next:  newEntry.Index,
 		}
 	}
-	r.RaftLog.entries = append(r.RaftLog.entries, newEntry)
+	r.leaderAppendEntries([]*pb.Entry{&newEntry})
 	r.AppendEntry() // 马上广播发送 append rpc，让之前 leader 可以 commit 但未 commit 的 log 快速 committed
 }
 
@@ -459,12 +462,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 			r.becomeFollower(m.Term, None)
 		}
 	case pb.MessageType_MsgPropose:
-		for i := range m.Entries {
-			m.Entries[i].Term = r.Term
-			m.Entries[i].Index = r.RaftLog.LastIndex() + uint64(i) + 1
-		}
-		r.appendEntry(m.Entries)
-		r.Prs[r.id].Match, r.Prs[r.id].Next = r.RaftLog.LastIndex(), r.RaftLog.LastIndex()+1
+		r.leaderAppendEntries(m.Entries)
 		r.AppendEntry()
 	case pb.MessageType_MsgAppend:
 		r.AppendEntry()
@@ -533,9 +531,23 @@ func (r *Raft) isCampaignWin() int {
 	}
 	return 0
 }
+// leader append log entry
+func (r *Raft) leaderAppendEntries(entries []*pb.Entry) {
+	var newEntries []pb.Entry
+	for _, entry := range entries {
+		newEntries = append(newEntries, pb.Entry{
+			EntryType:            entry.EntryType,
+			Term:                 r.Term,
+			Index:                r.RaftLog.LastIndex() + 1,
+			Data:                 entry.Data,
+		})
+	}
+	r.RaftLog.entries = append(r.RaftLog.entries, newEntries...)
+	r.Prs[r.id].Match, r.Prs[r.id].Next = r.RaftLog.LastIndex(), r.RaftLog.LastIndex() + 1
+}
 
-// 将 command 加入 log
-func (r *Raft) appendEntry(entries []*pb.Entry) {
+// non-leader(follower and candidate) append log entries
+func (r *Raft) nonLeaderAppendEntries(entries []*pb.Entry) {
 	for _, entry := range entries {
 		newEntry := pb.Entry{
 			EntryType: entry.EntryType,
@@ -544,18 +556,6 @@ func (r *Raft) appendEntry(entries []*pb.Entry) {
 			Data:      entry.Data,
 		}
 		r.RaftLog.entries = append(r.RaftLog.entries, newEntry)
-	}
-}
-
-// send log to peers
-func (r *Raft) AppendEntry() {
-	if len(r.peers) == 1 {
-		r.RaftLog.committed = r.RaftLog.LastIndex()
-	}
-	for _, to := range r.peers {
-		if to != r.id {
-			r.sendAppend(to)
-		}
 	}
 }
 
@@ -579,9 +579,9 @@ func (r *Raft) maybeCommit() bool {
 	for i := newCommit + 1; i <= r.RaftLog.LastIndex(); i++ {
 		term, _ := r.RaftLog.Term(i)
 		if term == r.Term { // 只commit当前 term 的 log
-			cnt := 1
-			for id, prs := range r.Prs {
-				if id != r.id && prs.Match >= i {
+			cnt := 0
+			for _, prs := range r.Prs {
+				if prs.Match >= i {
 					cnt++
 				}
 			}
@@ -619,10 +619,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	for i, entry := range m.Entries {
 		if term, err := r.RaftLog.Term(entry.Index); err != nil || term != entry.Term {
 			if term != entry.Term && entry.Index <= r.RaftLog.LastIndex() {
-				//r.RaftLog.entries = r.RaftLog.entries[:entry.Index]
 				r.RaftLog.discard(entry.Index)
 			}
-			r.appendEntry(m.Entries[i:])
+			r.nonLeaderAppendEntries(m.Entries[i:])
 			break
 		}
 	}
